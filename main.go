@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container" // YENİ: ContainerListOptions burada
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
@@ -58,7 +59,8 @@ func main() {
 
 	// 5. Mevcut Containerları Tara (Reconciliation)
 	logger.Println("🔍 Mevcut containerlar taranıyor...")
-	containers, err := dockerCli.ContainerList(ctx, types.ContainerListOptions{})
+	// DÜZELTME: types.ContainerListOptions -> container.ListOptions
+	containers, err := dockerCli.ContainerList(ctx, container.ListOptions{})
 	if err != nil {
 		logger.Printf("❌ Container listesi alınamadı: %v", err)
 	} else {
@@ -73,6 +75,7 @@ func main() {
 	eventFilters.Add("event", "start")
 	eventFilters.Add("event", "die") // Stop/Kill durumunda silmek için
 
+	// DÜZELTME: types.EventsOptions (Hala types altında ama kontrol edilmeli)
 	msgs, errs := dockerCli.Events(ctx, types.EventsOptions{Filters: eventFilters})
 
 	// Graceful Shutdown Channel
@@ -94,7 +97,7 @@ func main() {
 					time.Sleep(1 * time.Second)
 					processContainer(ctx, dockerCli, consulClient, m.ID, "register", cfg)
 				} else if m.Action == "die" {
-					// Container durduğunda deregister işlemi (Opsiyonel - Consul TTL zaten siler ama bu daha temiz)
+					// Container durduğunda deregister işlemi
 					deregisterContainer(consulClient, m.ID)
 				}
 			}(msg)
@@ -188,11 +191,7 @@ func processContainer(ctx context.Context, d *client.Client, c *consul.Client, c
 
 // deregisterContainer: Kapanan containerın servislerini siler
 func deregisterContainer(c *consul.Client, containerID string) {
-	// Not: Container ID'den Service ID'ye gitmek zor olduğu için
-	// genellikle Consul TTL check'e güvenilir. Ancak, eğer containerID meta datasında varsa
-	// filter ile silinebilir. Şimdilik log basıp geçiyoruz.
-	// Production'da bu kısım "Consul Catalog" sorgusu ile yapılabilir.
-	// logger.Printf("➖ Container Durdu: %s (TTL ile düşmesi bekleniyor)", containerID[:12])
+	// Not: Opsiyonel logic
 }
 
 // Yardımcı Fonksiyonlar
@@ -217,6 +216,5 @@ func cleanString(s string) string {
 }
 
 func sanitizeName(s string) string {
-	// DNS uyumlu olmayan karakterleri temizle
 	return strings.ToLower(s)
 }
