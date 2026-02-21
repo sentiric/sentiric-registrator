@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container" // YENİ: ContainerListOptions burada
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
@@ -59,7 +59,6 @@ func main() {
 
 	// 5. Mevcut Containerları Tara (Reconciliation)
 	logger.Println("🔍 Mevcut containerlar taranıyor...")
-	// DÜZELTME: types.ContainerListOptions -> container.ListOptions
 	containers, err := dockerCli.ContainerList(ctx, container.ListOptions{})
 	if err != nil {
 		logger.Printf("❌ Container listesi alınamadı: %v", err)
@@ -75,7 +74,6 @@ func main() {
 	eventFilters.Add("event", "start")
 	eventFilters.Add("event", "die") // Stop/Kill durumunda silmek için
 
-	// DÜZELTME: types.EventsOptions (Hala types altında ama kontrol edilmeli)
 	msgs, errs := dockerCli.Events(ctx, types.EventsOptions{Filters: eventFilters})
 
 	// Graceful Shutdown Channel
@@ -127,10 +125,13 @@ func processContainer(ctx context.Context, d *client.Client, c *consul.Client, c
 		}
 	}
 
-	// IGNORE Kontrolü
+	// IGNORE Kontrolü (Tüm Servis)
 	if envMap["SERVICE_IGNORE"] == "true" {
 		return
 	}
+
+	// IGNORE PORTS Hazırlığı
+	ignoreRanges := parseIgnorePorts(envMap["SERVICE_IGNORE_PORTS"])
 
 	// Servis İsmi Belirle
 	// Öncelik: ENV > Container Name
@@ -154,6 +155,13 @@ func processContainer(ctx context.Context, d *client.Client, c *consul.Client, c
 			hostPortStr := bindings[0].HostPort
 			hostPort, _ := strconv.Atoi(hostPortStr)
 
+			// FİLTRELEME KONTROLÜ
+			if isPortIgnored(hostPort, ignoreRanges) {
+				// Debug logu çok kirletmemek için burayı kapalı tutabiliriz veya debug level ekleyebiliriz
+				// logger.Printf("🚫 IGNORING PORT: %d for %s", hostPort, serviceName)
+				continue
+			}
+
 			// ID Unique olmalı: Hostname-ServiceName-Port
 			serviceID := fmt.Sprintf("%s-%s-%d", cfg.HostName, serviceName, hostPort)
 
@@ -170,7 +178,7 @@ func processContainer(ctx context.Context, d *client.Client, c *consul.Client, c
 				},
 				// TCP Health Check
 				Check: &consul.AgentServiceCheck{
-					Name:                           fmt.Sprintf("TCP Check %s", serviceName),
+					Name:                           fmt.Sprintf("TCP Check %s:%d", serviceName, hostPort),
 					TCP:                            fmt.Sprintf("%s:%d", cfg.NodeIP, hostPort),
 					Interval:                       "15s",
 					Timeout:                        "5s",
@@ -191,10 +199,58 @@ func processContainer(ctx context.Context, d *client.Client, c *consul.Client, c
 
 // deregisterContainer: Kapanan containerın servislerini siler
 func deregisterContainer(c *consul.Client, containerID string) {
-	// Not: Opsiyonel logic
+	// Not: Opsiyonel logic. Consul genellikle TTL veya Check fail ile siler,
+	// ancak temiz bir deregister için containerID'yi meta'da saklayıp
+	// tüm servisleri tarayarak silmek gerekir.
+	// Şimdilik basit tutuyoruz, Consul health check temizleyecek.
 }
 
-// Yardımcı Fonksiyonlar
+// --- YARDIMCI FONKSİYONLAR ---
+
+type PortRange struct {
+	Start int
+	End   int
+}
+
+// parseIgnorePorts: "30000-30100,8080" formatını parse eder
+func parseIgnorePorts(envVal string) []PortRange {
+	var ranges []PortRange
+	if envVal == "" {
+		return ranges
+	}
+
+	parts := strings.Split(envVal, ",")
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if strings.Contains(p, "-") {
+			bounds := strings.Split(p, "-")
+			if len(bounds) == 2 {
+				start, _ := strconv.Atoi(strings.TrimSpace(bounds[0]))
+				end, _ := strconv.Atoi(strings.TrimSpace(bounds[1]))
+				if start > 0 && end > 0 {
+					ranges = append(ranges, PortRange{Start: start, End: end})
+				}
+			}
+		} else {
+			port, _ := strconv.Atoi(p)
+			if port > 0 {
+				ranges = append(ranges, PortRange{Start: port, End: port})
+			}
+		}
+	}
+	return ranges
+}
+
+// isPortIgnored: Bir portun yasaklı listede olup olmadığını kontrol eder
+func isPortIgnored(port int, ranges []PortRange) bool {
+	for _, r := range ranges {
+		if port >= r.Start && port <= r.End {
+			return true
+		}
+	}
+	return false
+}
+
 func loadConfig() Config {
 	hostname, _ := os.Hostname()
 	return Config{
