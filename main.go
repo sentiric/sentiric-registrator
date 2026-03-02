@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"strconv"
@@ -17,27 +16,72 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 	consul "github.com/hashicorp/consul/api"
+	"github.com/rs/zerolog"
 )
 
 // Config - Uygulama konfigürasyonu
 type Config struct {
-	NodeIP    string
-	ConsulURL string
-	HostName  string
+	NodeIP         string
+	ConsulURL      string
+	HostName       string
+	Env            string
+	LogLevel       string
+	LogFormat      string
+	ServiceVersion string
 }
 
-// Global Logger
-var logger = log.New(os.Stdout, "[SENTIRIC-REGISTRATOR] ", log.LstdFlags)
+// setupLogger: SUTS v4.0 standartlarına uygun loglayıcı üretir
+func setupLogger(cfg Config) zerolog.Logger {
+	level, err := zerolog.ParseLevel(cfg.LogLevel)
+	if err != nil {
+		level = zerolog.InfoLevel
+	}
+
+	zerolog.TimeFieldFormat = time.RFC3339Nano
+	zerolog.TimestampFieldName = "ts"
+	zerolog.LevelFieldName = "severity"
+	zerolog.MessageFieldName = "message"
+	zerolog.LevelFieldMarshalFunc = func(l zerolog.Level) string {
+		return strings.ToUpper(l.String())
+	}
+
+	resourceContext := zerolog.Dict().
+		Str("service.name", "registrator-service").
+		Str("service.version", cfg.ServiceVersion).
+		Str("service.env", cfg.Env).
+		Str("host.name", cfg.HostName)
+
+	var zlogger zerolog.Logger
+	if cfg.LogFormat == "json" {
+		zlogger = zerolog.New(os.Stdout).With().
+			Timestamp().
+			Str("schema_v", "1.0.0").
+			Str("tenant_id", "system").
+			Dict("resource", resourceContext).
+			Logger()
+	} else {
+		output := zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}
+		zlogger = zerolog.New(output).With().Timestamp().Str("service", "registrator").Logger()
+	}
+
+	return zlogger.Level(level)
+}
 
 func main() {
 	// 1. Konfigürasyon Yükle
 	cfg := loadConfig()
-	logger.Printf("🚀 Başlatılıyor... Node: %s | Consul: %s", cfg.NodeIP, cfg.ConsulURL)
+	logger := setupLogger(cfg)
+
+	logger.Info().
+		Str("event", "SYSTEM_STARTUP").
+		Str("node_ip", cfg.NodeIP).
+		Str("consul_url", cfg.ConsulURL).
+		Msg("🚀 Registrator başlatılıyor...")
 
 	// 2. Docker Client Başlat
 	dockerCli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		logger.Fatalf("❌ Docker Client Hatası: %v", err)
+		logger.Fatal().Err(err).Msg("❌ Docker Client Hatası")
 	}
 
 	// 3. Consul Client Başlat
@@ -45,26 +89,26 @@ func main() {
 	consulConfig.Address = strings.Replace(cfg.ConsulURL, "http://", "", 1)
 	consulClient, err := consul.NewClient(consulConfig)
 	if err != nil {
-		logger.Fatalf("❌ Consul Client Hatası: %v", err)
+		logger.Fatal().Err(err).Msg("❌ Consul Client Hatası")
 	}
 
 	// 4. Bağlantı Testi
 	_, err = consulClient.Agent().NodeName()
 	if err != nil {
-		logger.Printf("⚠️ UYARI: Consul'a erişilemiyor (%v). Retry bekleniyor...", err)
+		logger.Warn().Err(err).Msg("⚠️ Consul'a erişilemiyor. Retry bekleniyor...")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// 5. Mevcut Containerları Tara (Reconciliation)
-	logger.Println("🔍 Mevcut containerlar taranıyor...")
+	logger.Info().Str("event", "CONTAINER_SCAN_START").Msg("🔍 Mevcut containerlar taranıyor...")
 	containers, err := dockerCli.ContainerList(ctx, container.ListOptions{})
 	if err != nil {
-		logger.Printf("❌ Container listesi alınamadı: %v", err)
+		logger.Error().Err(err).Msg("❌ Container listesi alınamadı")
 	} else {
 		for _, c := range containers {
-			processContainer(ctx, dockerCli, consulClient, c.ID, "register", cfg)
+			processContainer(ctx, dockerCli, consulClient, c.ID, "register", cfg, logger)
 		}
 	}
 
@@ -80,39 +124,34 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	logger.Println("👂 Docker Event Loop Dinleniyor...")
+	logger.Info().Str("event", "EVENT_LOOP_START").Msg("👂 Docker Event Loop Dinleniyor...")
 
 	for {
 		select {
 		case err := <-errs:
-			logger.Fatalf("🔥 Kritik Docker Event Hatası: %v", err)
+			logger.Fatal().Err(err).Msg("🔥 Kritik Docker Event Hatası")
 
 		case msg := <-msgs:
-			// Event İşleyici
 			go func(m events.Message) {
 				if m.Action == "start" {
-					// Ağın oturması için kısa bekleme
 					time.Sleep(1 * time.Second)
-					processContainer(ctx, dockerCli, consulClient, m.ID, "register", cfg)
+					processContainer(ctx, dockerCli, consulClient, m.ID, "register", cfg, logger)
 				} else if m.Action == "die" {
-					// Container durduğunda deregister işlemi
-					deregisterContainer(consulClient, m.ID)
+					deregisterContainer(consulClient, m.ID, logger)
 				}
 			}(msg)
 
 		case <-sigChan:
-			logger.Println("🛑 Kapatılıyor...")
+			logger.Info().Str("event", "SYSTEM_SHUTDOWN").Msg("🛑 Kapatılıyor...")
 			return
 		}
 	}
 }
 
 // processContainer: Tek bir containerı analiz eder ve Consul'a kaydeder
-func processContainer(ctx context.Context, d *client.Client, c *consul.Client, containerID string, action string, cfg Config) {
-	// Container Detaylarını Çek
+func processContainer(ctx context.Context, d *client.Client, c *consul.Client, containerID string, action string, cfg Config, logger zerolog.Logger) {
 	cj, err := d.ContainerInspect(ctx, containerID)
 	if err != nil {
-		// Container o an silinmiş olabilir
 		return
 	}
 
@@ -125,24 +164,21 @@ func processContainer(ctx context.Context, d *client.Client, c *consul.Client, c
 		}
 	}
 
-	// IGNORE Kontrolü (Tüm Servis)
+	// IGNORE Kontrolü
 	if envMap["SERVICE_IGNORE"] == "true" {
 		return
 	}
 
-	// IGNORE PORTS Hazırlığı
 	ignoreRanges := parseIgnorePorts(envMap["SERVICE_IGNORE_PORTS"])
 
 	// Servis İsmi Belirle
-	// Öncelik: ENV > Container Name
 	serviceName := envMap["SERVICE_NAME"]
 	if serviceName == "" {
 		serviceName = strings.TrimPrefix(cj.Name, "/")
-		serviceName = strings.TrimPrefix(serviceName, "sentiric-") // Prefix temizliği
+		serviceName = strings.TrimPrefix(serviceName, "sentiric-")
 	}
 	serviceName = sanitizeName(serviceName)
 
-	// Port Mapping Kontrolü
 	ports := cj.NetworkSettings.Ports
 	if len(ports) == 0 {
 		return
@@ -150,22 +186,16 @@ func processContainer(ctx context.Context, d *client.Client, c *consul.Client, c
 
 	for portKey, bindings := range ports {
 		if len(bindings) > 0 {
-			// portKey örneğin: "80/tcp"
 			proto := portKey.Proto()
 			hostPortStr := bindings[0].HostPort
 			hostPort, _ := strconv.Atoi(hostPortStr)
 
-			// FİLTRELEME KONTROLÜ
 			if isPortIgnored(hostPort, ignoreRanges) {
-				// Debug logu çok kirletmemek için burayı kapalı tutabiliriz veya debug level ekleyebiliriz
-				// logger.Printf("🚫 IGNORING PORT: %d for %s", hostPort, serviceName)
 				continue
 			}
 
-			// ID Unique olmalı: Hostname-ServiceName-Port
 			serviceID := fmt.Sprintf("%s-%s-%d", cfg.HostName, serviceName, hostPort)
 
-			// Consul Payload
 			registration := &consul.AgentServiceRegistration{
 				ID:      serviceID,
 				Name:    serviceName,
@@ -176,7 +206,6 @@ func processContainer(ctx context.Context, d *client.Client, c *consul.Client, c
 					"container_id": cj.ID[:12],
 					"image":        cj.Config.Image,
 				},
-				// TCP Health Check
 				Check: &consul.AgentServiceCheck{
 					Name:                           fmt.Sprintf("TCP Check %s:%d", serviceName, hostPort),
 					TCP:                            fmt.Sprintf("%s:%d", cfg.NodeIP, hostPort),
@@ -186,33 +215,35 @@ func processContainer(ctx context.Context, d *client.Client, c *consul.Client, c
 				},
 			}
 
-			// Kayıt İşlemi
 			err := c.Agent().ServiceRegister(registration)
 			if err != nil {
-				logger.Printf("❌ Kayıt Başarısız: %s -> %v", serviceName, err)
+				logger.Error().
+					Str("event", "SERVICE_REGISTER_FAILED").
+					Err(err).
+					Str("registered_service", serviceName).
+					Msg("❌ Kayıt Başarısız")
 			} else {
-				logger.Printf("➕ KAYIT EDİLDİ: %s [%s] -> %s:%d", serviceName, serviceID, cfg.NodeIP, hostPort)
+				logger.Info().
+					Str("event", "SERVICE_REGISTERED").
+					Str("registered_service", serviceName).
+					Str("target_ip", cfg.NodeIP).
+					Int("target_port", hostPort).
+					Msgf("➕ KAYIT EDİLDİ: %s", serviceName)
 			}
 		}
 	}
 }
 
 // deregisterContainer: Kapanan containerın servislerini siler
-func deregisterContainer(c *consul.Client, containerID string) {
-	// Not: Opsiyonel logic. Consul genellikle TTL veya Check fail ile siler,
-	// ancak temiz bir deregister için containerID'yi meta'da saklayıp
-	// tüm servisleri tarayarak silmek gerekir.
-	// Şimdilik basit tutuyoruz, Consul health check temizleyecek.
+func deregisterContainer(c *consul.Client, containerID string, logger zerolog.Logger) {
+	// Consul TTL/Check mantığıyla kendi siliyor. Şimdilik pasif bırakıyoruz.
 }
-
-// --- YARDIMCI FONKSİYONLAR ---
 
 type PortRange struct {
 	Start int
 	End   int
 }
 
-// parseIgnorePorts: "30000-30100,8080" formatını parse eder
 func parseIgnorePorts(envVal string) []PortRange {
 	var ranges []PortRange
 	if envVal == "" {

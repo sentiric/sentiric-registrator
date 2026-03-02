@@ -7,6 +7,7 @@ toolchain go1.24.11
 require (
 	github.com/docker/docker v26.1.5+incompatible
 	github.com/hashicorp/consul/api v1.26.1
+	github.com/rs/zerolog v1.34.0
 )
 
 require (
@@ -31,7 +32,7 @@ require (
 	github.com/hashicorp/golang-lru v0.5.4 // indirect
 	github.com/hashicorp/serf v0.10.1 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
-	github.com/mattn/go-isatty v0.0.17 // indirect
+	github.com/mattn/go-isatty v0.0.19 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
