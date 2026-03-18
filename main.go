@@ -1,3 +1,4 @@
+// Dosya: main.go
 package main
 
 import (
@@ -282,12 +283,18 @@ func isPortIgnored(port int, ranges []PortRange) bool {
 	return false
 }
 
+// [ARCH-COMPLIANCE] constraints.yaml gereğince üretim (production) loglarının SUTS v4.0 JSON formatında
+// basılabilmesi için config yapısı env okumalarını destekleyecek şekilde güncellendi.
 func loadConfig() Config {
 	hostname, _ := os.Hostname()
 	return Config{
-		NodeIP:    getEnv("NODE_IP", "127.0.0.1"),
-		ConsulURL: getEnv("CONSUL_URL", "http://discovery-service:8500"),
-		HostName:  getEnv("NODE_HOSTNAME", hostname),
+		NodeIP:         getEnv("NODE_IP", "127.0.0.1"),
+		ConsulURL:      getEnv("CONSUL_URL", "http://discovery-service:8500"),
+		HostName:       getEnv("NODE_HOSTNAME", hostname),
+		Env:            getEnv("APP_ENV", "production"),
+		LogLevel:       getEnv("LOG_LEVEL", "info"),
+		LogFormat:      getEnv("LOG_FORMAT", "json"), // Default olarak JSON dayatılır
+		ServiceVersion: getEnv("SERVICE_VERSION", "1.0.0"),
 	}
 }
 
