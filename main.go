@@ -1,4 +1,3 @@
-// Dosya: main.go
 package main
 
 import (
@@ -26,9 +25,9 @@ import (
 //go:embed dashboard.html
 var dashboardHTML string
 
-// ServiceMapping: ContainerID -> ServiceIDs (Multiple ports support)
+// Bellek Yönetimi: Hangi container hangi Consul ID'lerini kullanıyor?
 var (
-	registryMap = make(map[string][]string)
+	registryMap = make(map[string][]string) // ContainerID -> []ServiceID
 	mapMutex    sync.RWMutex
 )
 
@@ -40,10 +39,9 @@ type Config struct {
 	LogLevel       string
 	LogFormat      string
 	ServiceVersion string
-	TenantID       string
 	HttpPort       string
 	ResyncInterval int
-	IgnoreDefault  string
+	TenantID       string
 }
 
 func setupLogger(cfg Config) zerolog.Logger {
@@ -68,35 +66,34 @@ func main() {
 	cfg := loadConfig()
 	logger := setupLogger(cfg)
 
-	logger.Info().Str("event", "SYSTEM_STARTUP").Msg("🚀 Registrator Ultimate v1.2.5 başlatılıyor...")
+	logger.Info().Str("event", "SYSTEM_STARTUP").Msg("🚀 Registrator v1.3.0 başlatılıyor...")
 
-	// 1. Docker & Consul Clients
+	// 1. Docker Client
 	dockerCli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		logger.Fatal().Err(err).Msg("❌ Docker Client Hatası")
+		logger.Fatal().Err(err).Msg("❌ Docker hatası")
 	}
 
+	// 2. Consul Client
 	consulConfig := consul.DefaultConfig()
 	consulConfig.Address = strings.Replace(cfg.ConsulURL, "http://", "", 1)
 	consulClient, err := consul.NewClient(consulConfig)
 	if err != nil {
-		logger.Fatal().Err(err).Msg("❌ Consul Client Hatası")
+		logger.Fatal().Err(err).Msg("❌ Consul hatası")
 	}
 
-	// 2. Dashboard Server
+	// 3. UI Dashboard
 	go startDashboard(cfg, logger)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 3. Hybrid Sync (Event Driven + Periodic)
+	// 4. Reconciliation Loop (Zorunlu Eşitleme)
 	go func() {
 		ticker := time.NewTicker(time.Duration(cfg.ResyncInterval) * time.Second)
-		logger.Info().Int("interval_sec", cfg.ResyncInterval).Msg("🔄 Periyodik Reconciliation aktif.")
 		for {
 			select {
 			case <-ticker.C:
-				logger.Debug().Str("event", "RESYNC_TICK").Msg("Docker-Consul eşitlemesi başlıyor...")
 				syncAll(ctx, dockerCli, consulClient, cfg, logger)
 			case <-ctx.Done():
 				return
@@ -104,41 +101,33 @@ func main() {
 		}
 	}()
 
-	// 4. Docker Event Loop
+	// 5. Event Loop (Anlık Yakalama)
 	f := filters.NewArgs()
 	f.Add("type", "container")
 	msgs, errs := dockerCli.Events(ctx, types.EventsOptions{Filters: f})
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	logger.Info().Str("event", "EVENT_LOOP_READY").Msg("👂 Docker Socket dinleniyor...")
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
 	for {
 		select {
 		case err := <-errs:
-			logger.Error().Err(err).Msg("Docker Event Hatası")
+			logger.Error().Err(err).Msg("Docker socket hatası")
 		case msg := <-msgs:
-			switch msg.Action {
-			case "start":
-				time.Sleep(2 * time.Second) // Network settle
+			if msg.Action == "start" {
+				time.Sleep(2 * time.Second)
 				processContainer(ctx, dockerCli, consulClient, msg.ID, cfg, logger)
-			case "die", "kill", "stop":
+			} else if msg.Action == "die" || msg.Action == "kill" {
 				deregisterContainer(consulClient, msg.ID, logger)
 			}
-		case <-sigChan:
-			logger.Info().Str("event", "SYSTEM_SHUTDOWN").Msg("🛑 Registrator durduruluyor.")
+		case <-sig:
 			return
 		}
 	}
 }
 
 func syncAll(ctx context.Context, d *client.Client, c *consul.Client, cfg Config, logger zerolog.Logger) {
-	containers, err := d.ContainerList(ctx, container.ListOptions{})
-	if err != nil {
-		logger.Error().Err(err).Msg("Reconciliation list alınamadı")
-		return
-	}
+	containers, _ := d.ContainerList(ctx, container.ListOptions{})
 	for _, cont := range containers {
 		processContainer(ctx, d, c, cont.ID, cfg, logger)
 	}
@@ -150,7 +139,7 @@ func processContainer(ctx context.Context, d *client.Client, c *consul.Client, c
 		return
 	}
 
-	// Env Parse (İlettiğin eski koddaki logic korundu)
+	// ENV Analizi (Eski kodundaki mantığı tam koruyoruz)
 	envMap := make(map[string]string)
 	for _, e := range cj.Config.Env {
 		parts := strings.SplitN(e, "=", 2)
@@ -160,13 +149,13 @@ func processContainer(ctx context.Context, d *client.Client, c *consul.Client, c
 	}
 
 	// IGNORE Kontrolü
-	if envMap["SERVICE_IGNORE"] == "true" || (cfg.IgnoreDefault == "true" && envMap["SERVICE_IGNORE"] != "false") {
+	if envMap["SERVICE_IGNORE"] == "true" {
 		return
 	}
 
-	ignorePorts := parseIgnorePorts(envMap["SERVICE_IGNORE_PORTS"])
+	ignoreRanges := parseIgnorePorts(envMap["SERVICE_IGNORE_PORTS"])
 
-	// Servis İsmi
+	// Servis İsmi Belirle
 	serviceName := envMap["SERVICE_NAME"]
 	if serviceName == "" {
 		serviceName = strings.TrimPrefix(cj.Name, "/")
@@ -175,13 +164,18 @@ func processContainer(ctx context.Context, d *client.Client, c *consul.Client, c
 	serviceName = strings.ToLower(serviceName)
 
 	var registeredIDs []string
-	for portProto, bindings := range cj.NetworkSettings.Ports {
+
+	// Docker Port Eşleşmelerini Tara
+	for portKey, bindings := range cj.NetworkSettings.Ports {
 		if len(bindings) == 0 {
 			continue
 		}
 
+		proto := portKey.Proto()
 		hostPort, _ := strconv.Atoi(bindings[0].HostPort)
-		if isPortIgnored(hostPort, ignorePorts) {
+
+		// [KRİTİK FIX]: Ignore Kontrolü
+		if isPortIgnored(hostPort, ignoreRanges) {
 			continue
 		}
 
@@ -192,18 +186,23 @@ func processContainer(ctx context.Context, d *client.Client, c *consul.Client, c
 			Name:    serviceName,
 			Port:    hostPort,
 			Address: cfg.NodeIP,
-			Tags:    []string{portProto.Proto(), "sentiric", cfg.Env},
+			Tags:    []string{proto, "sentiric", cfg.Env},
 			Meta: map[string]string{
 				"container_id": containerID[:12],
 				"image":        cj.Config.Image,
 			},
-			Check: &consul.AgentServiceCheck{
-				Name:                           fmt.Sprintf("TCP Check %s:%d", serviceName, hostPort),
+		}
+
+		// [PROFESYONEL MANTIK]: Sadece TCP portlarına Health Check ekle
+		// UDP portları (SIP/RTP) için TCP check yapmak logları kirletir.
+		if proto == "tcp" {
+			registration.Check = &consul.AgentServiceCheck{
+				Name:                           fmt.Sprintf("TCP Check %d", hostPort),
 				TCP:                            fmt.Sprintf("%s:%d", cfg.NodeIP, hostPort),
-				Interval:                       "30s", // Log kirliliğini engellemek için 30s
+				Interval:                       "30s",
 				Timeout:                        "5s",
 				DeregisterCriticalServiceAfter: "1m",
-			},
+			}
 		}
 
 		if err := c.Agent().ServiceRegister(registration); err == nil {
@@ -228,9 +227,11 @@ func deregisterContainer(c *consul.Client, containerID string, logger zerolog.Lo
 		for _, id := range ids {
 			_ = c.Agent().ServiceDeregister(id)
 		}
-		logger.Info().Str("event", "DEREGISTER_SUCCESS").Str("container", containerID[:12]).Msg("➖ Kayıtlar silindi.")
+		logger.Debug().Str("container", containerID[:12]).Msg("➖ Kayıtlar temizlendi.")
 	}
 }
+
+type PortRange struct{ Start, End int }
 
 func parseIgnorePorts(envVal string) []PortRange {
 	var ranges []PortRange
@@ -254,8 +255,6 @@ func parseIgnorePorts(envVal string) []PortRange {
 	return ranges
 }
 
-type PortRange struct{ Start, End int }
-
 func isPortIgnored(port int, ranges []PortRange) bool {
 	for _, r := range ranges {
 		if port >= r.Start && port <= r.End {
@@ -272,39 +271,36 @@ func startDashboard(cfg Config, logger zerolog.Logger) {
 		res := []map[string]interface{}{}
 		for _, ids := range registryMap {
 			for _, id := range ids {
-				parts := strings.Split(id, "-")
-				port := parts[len(parts)-1]
-				name := strings.TrimSuffix(id, "-"+port)
-				res = append(res, map[string]interface{}{"id": id, "name": name, "port": port})
+				p := strings.Split(id, "-")
+				port := p[len(p)-1]
+				res = append(res, map[string]interface{}{
+					"id": id, "name": strings.TrimSuffix(id, "-"+port), "port": port, "proto": "tcp/udp",
+				})
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(res)
 	})
-
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		fmt.Fprint(w, dashboardHTML)
 	})
-
-	logger.Info().Str("event", "UI_READY").Str("port", cfg.HttpPort).Msg("🖥️ Dashboard UI Aktif.")
 	http.ListenAndServe(":"+cfg.HttpPort, nil)
 }
 
 func loadConfig() Config {
-	hostname, _ := os.Hostname()
+	h, _ := os.Hostname()
 	return Config{
 		NodeIP:         getEnv("NODE_IP", "127.0.0.1"),
 		ConsulURL:      getEnv("CONSUL_URL", "http://discovery-service:8500"),
-		HostName:       getEnv("NODE_HOSTNAME", hostname),
+		HostName:       getEnv("NODE_HOSTNAME", h),
 		Env:            getEnv("ENV", "production"),
 		LogLevel:       getEnv("LOG_LEVEL", "info"),
 		LogFormat:      getEnv("LOG_FORMAT", "json"),
-		ServiceVersion: "1.2.5",
+		ServiceVersion: "1.3.0",
+		HttpPort:       getEnv("REGISTRATOR_HTTP_PORT", "11090"),
+		ResyncInterval: getIntEnv("REGISTRATOR_RESYNC", 60),
 		TenantID:       getEnv("TENANT_ID", "system"),
-		HttpPort:       getEnv("REGISTRATOR_HTTP_PORT", "11090"), // Compose ile uyumlu
-		ResyncInterval: getIntEnv("REGISTRATOR_RESYNC", 60),      // Periyodik eşitleme (default 60s)
-		IgnoreDefault:  getEnv("SERVICE_IGNORE", "false"),
 	}
 }
 
@@ -317,7 +313,8 @@ func getEnv(k, f string) string {
 
 func getIntEnv(k string, f int) int {
 	v := getEnv(k, "")
-	if i, err := strconv.Atoi(v); err == nil {
+	i, err := strconv.Atoi(v)
+	if err == nil {
 		return i
 	}
 	return f
