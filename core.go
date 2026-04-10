@@ -118,7 +118,8 @@ func deregisterContainer(c *consul.Client, containerID string, logger zerolog.Lo
 		for _, id := range ids {
 			_ = c.Agent().ServiceDeregister(id)
 		}
-		logger.Debug().Str("container", containerID[:12]).Msg("➖ Kayıtlar temizlendi.")
+		// [ARCH-COMPLIANCE] SUTS v4.2: Rutin temizlik INFO'dan DEBUG'a çekildi.
+		logger.Debug().Str("event", "CONTAINER_DEREGISTERED").Str("container", containerID[:12]).Msg("➖ Kayıtlar temizlendi.")
 	}
 }
 
